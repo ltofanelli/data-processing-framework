@@ -25,13 +25,14 @@
 | Period | A slice of the target replaced as a whole by `replace_where` (for example, a month). |
 | Final name | A column's name after the rename and the special-character fix. |
 | Metadata generated in the run | A metadata column that the current run creates (see `META-01`). |
+| Run context | Read-only information about the current run, available to extension points (EXT-02). |
 
 ---
 
 ## 2. Principles
 
 - **PRI-01** The common path MUST be configurable with text parameters only: `source`, `target`, `file_format`, `modified_date`, `write_mode`, `merge_key`, `scd2`, `rename_columns`, `data_types`. Out-of-pattern cases use sub-parameters; very specific cases use extension points in code (`transform`, `Reader`, `Writer`, `DQRule`).
-- **PRI-02** The framework MUST NOT depend on a control table or a log process. The state is the target itself. The only exception is `discovery = "external_checkpoint"`, where the control table is provided by the user.
+- **PRI-02** The framework MUST NOT depend on a control table or a log process. The state is the target itself.
 - **PRI-03** Listing, checking and moving files MUST go through the `FileSystemAdapter` interface. No other part of the framework accesses the file system directly.
 - **PRI-04** Validity MUST come from the source or the extraction (column, file date, date in the path or a provided value). It MUST NOT come from the time the framework processes the data.
 - **PRI-05** Every parameter that references a column uses the **final name**. Only `rename_columns` uses the source name. To filter the source, the framework translates the final name through the rename map.
@@ -49,7 +50,6 @@
 | `target` | str | required | Name `schema.table` or path | SRC-02, SRC-03 |
 | `write_mode` | str | required | `append`, `overwrite`, `replace_where`, `upsert` | WRT-* |
 | `run_id` | str | generated UUID | Run identifier, usually sent by the orchestrator | META-04 |
-| `transform` | function | — | `transform(df, ctx) -> df` | CONF-01 |
 
 ### 3.2 File source
 
@@ -57,9 +57,9 @@
 |---|---|---|---|---|
 | `file_format` | str | — | Spark read format (`parquet`, `csv`, `json`...). Setting it makes the source a file source | SRC-01 |
 | `read_options` | dict | `{}` | Options passed to the Spark reader | — |
-| `discovery` | str | `incremental` | `incremental`, `file_compare`, `external_checkpoint`, `folder_pattern` | DISC-* |
+| `discovery` | str | `incremental` | `incremental`, `file_compare`, `folder_pattern` | DISC-* |
 | `chunk_size` | int | no chunk: 1 batch | ≥ 1 | DISC-07 |
-| `path_pattern` | str | — | Not specified in v1 | §10 |
+| `path_pattern` | str | — (every file) | Glob relative to `source`, e.g. `**/*.parquet` | DISC-06 |
 
 ### 3.3 Table source
 
@@ -95,6 +95,7 @@
 | Parameter | Type | Default | Values / format | Rules |
 |---|---|---|---|---|
 | `data_types` | dict | — | Column (final name) → Spark type | DQ-03 |
+| `dq_rules` | list[dict] | — | Declarative rules: `name`, `condition` (SQL expression a valid row satisfies) and optional `action` | DQ-04 |
 | `rules` | list[DQRule] | — | Custom rules, in code | DQ-04 |
 | `quarantine_table` | str | — | Name or path of the quarantine table | DQ-05, DQ-06 |
 | `gate_type` | str | — (no gate) | `count`, `percent` | DQ-07 |
@@ -129,7 +130,7 @@ run(config):
     for each batch, in planned order:
         batch_ts = current time                       # META-02
         df = read(batch)                              # SCH-01
-        if config.transform: df = transform(df, ctx)
+        df = self.transform(df)                       # EXT-01
         df = rename(df)                               # CONF-02
         df = fix_names(df)                            # CONF-03
         df = resolve_validity(df)                     # VAL-05
@@ -159,7 +160,7 @@ plan(config), table source:
     return [rows]
 
 plan(config), file source:
-    files = list(source)                                              # DISC-01
+    files = list(source), filtered by path_pattern                    # DISC-01, DISC-06
     if replace_period_source == value:
         return [files whose period in the path == replace_period]     # PER-05
     if discovery == folder_pattern:
@@ -189,7 +190,7 @@ plan(config), file source:
 - **DISC-03** Selected files MUST be sorted by (modification time, path) before being grouped into batches.
 - **DISC-04** Ties in `incremental` are not handled: a file with the same time as the target's maximum is not read. This is the expected v1 behavior; `file_compare` avoids the problem.
 - **DISC-05** `file_compare`: selects files whose path is not among the distinct `_source_file_path` values on the target. The file's identity is its path: a file rewritten with the same name is not read again.
-- **DISC-06** `external_checkpoint`: compares the listing with a control table provided by the user. The format of that table is not specified in v1.
+- **DISC-06** `path_pattern` is a glob relative to `source` (for example, `**/*.parquet` or `sales_*.csv`), applied to the listed files before discovery. Without it, every listed file is considered; DISC-01 still applies.
 - **DISC-07** No `chunk_size`: all selected files in one batch. `chunk_size = N`: N files per batch. With `folder_pattern`, N counts folders (PER-04).
 - **DISC-08** No file selected: the run ends with status `no_new_data`, without writing.
 - **DISC-09** With `write_mode = "overwrite"`, discovery only decides whether there is a new file. If there is, all listed files MUST be read, in a single batch.
@@ -243,13 +244,14 @@ plan(config), file source:
 - **DQ-01** DQ runs after Conform and before dedup.
 - **DQ-02** Automatic rules, with the quarantine action: `merge_key`, `_modified_date` and `order_column` (when set) not null.
 - **DQ-03** `data_types` converts the columns to the given types. A row whose value does not convert goes to quarantine; valid rows are written already converted.
-- **DQ-04** Each `DQRule` has an action:
-  - `FAIL`: a failing row fails the run;
-  - `QUARANTINE`: the row goes to quarantine;
-  - `WARN`: the row continues and is counted in `dq_by_rule`.
+- **DQ-04** Rules come from `dq_rules` and from `rules`, and each rule has an action:
+  - `dq_rules`: declarative rules. `name` is required and unique; `condition` is a Spark SQL expression over final column names that a **valid** row satisfies; `action` is optional (default `quarantine`). A row fails the rule when `condition` is false or null. Conditions are evaluated on the values already converted by `data_types`.
+  - `rules`: `DQRule` objects in code, for logic that does not fit an expression.
+  - Actions: `FAIL` (a failing row fails the run), `QUARANTINE` (the row goes to quarantine), `WARN` (the row continues and is counted in `dq_by_rule`).
 - **DQ-05** Without `quarantine_table`, a row that would go to quarantine fails the run.
-- **DQ-06** Quarantined rows are written to `quarantine_table`, even when the gate is exceeded. They go back to quarantine on every run until they are fixed at the source.
+- **DQ-06** Quarantined rows are appended to `quarantine_table`, even when the gate is exceeded. They go back to quarantine on every run until they are fixed at the source.
 - **DQ-07** The gate evaluates each whole batch. `count`: exceeded when the quarantined rows exceed `gate_threshold`. `percent`: exceeded when `quarantined rows / rows read × 100` exceeds `gate_threshold`. Gate exceeded: the batch is not written and the run ends with `gate_failed`. Without `gate_type`, there is no gate.
+- **DQ-08** The quarantine table has the row's columns (final names) with their values **before** the `data_types` conversion, the run's metadata columns and `_dq_failed_rules`: an array with the name of every rule the row failed. Automatic rules are named `not_null:<column>` and `type:<column>`. New columns are added as in SCH-02.
 
 ### 5.7 Dedup (DED)
 
@@ -312,7 +314,7 @@ plan(config), file source:
   - with a checkpoint, the window (CKP-06) only identifies the periods with new rows, and the framework MUST re-read every source row of those periods before replacing them;
   - without a checkpoint, the source is read in full;
   - with `custom_query`, the query must return complete periods.
-- **PER-07** The period is written to `_period`, and `replaceWhere` replaces the `_period` values present in the batch. Replaced periods are reported in `periods_replaced`.
+- **PER-07** The period is written to `_period`. With `path` and `value`, `_period` is a `date`: the first day of the period, parsed with `replace_period_format`, so `2026-08` and `202608` both become `2026-08-01`. With `column`, it keeps the column's value and type. `replaceWhere` replaces the `_period` values present in the batch. Replaced periods are reported in `periods_replaced`.
 
 ### 5.11 Schema (SCH)
 
@@ -353,7 +355,7 @@ Default values:
 
 | Class | Member | Value |
 |---|---|---|
-| `MetadataColumns` | `RUN_ID`, `CREATED_TS`, `UPDATED_TS`, `MODIFIED_DATE`, `SOURCE_FILE_PATH`, `SOURCE_FILE_MODIFIED_TS`, `PERIOD`, `VALID_FROM`, `VALID_TO`, `IS_CURRENT`, `VERSION` | `_run_id`, `_created_ts`, `_updated_ts`, `_modified_date`, `_source_file_path`, `_source_file_modified_ts`, `_period`, `_valid_from`, `_valid_to`, `_is_current`, `_version` |
+| `MetadataColumns` | `RUN_ID`, `CREATED_TS`, `UPDATED_TS`, `MODIFIED_DATE`, `SOURCE_FILE_PATH`, `SOURCE_FILE_MODIFIED_TS`, `PERIOD`, `VALID_FROM`, `VALID_TO`, `IS_CURRENT`, `VERSION`, `DQ_FAILED_RULES` | `_run_id`, `_created_ts`, `_updated_ts`, `_modified_date`, `_source_file_path`, `_source_file_modified_ts`, `_period`, `_valid_from`, `_valid_to`, `_is_current`, `_version`, `_dq_failed_rules` |
 | `Defaults` | `DATETIME_FORMAT` | `yyyy-MM-dd HH:mm:ss.SSSSSS` |
 | `Defaults` | `SCD2_FIRST_VALID_FROM` | `1900-01-01` |
 | `Defaults` | `SCD2_CURRENT_VALID_TO` | `9999-12-31` |
@@ -363,6 +365,12 @@ Default values:
 - **ERR-01** Any error stops the run: the current batch is not written and the following batches are not processed. Examples: read, schema, write, `FAIL` in DQ, quarantine without `quarantine_table`, gate exceeded.
 - **ERR-02** Previous batches remain written. The next run resumes from the failed batch, through the checkpoint.
 - **ERR-03** A row sent to quarantine is not an error.
+
+### 5.15 Extension points (EXT)
+
+- **EXT-01** `Pipeline.transform(df) -> DataFrame` is an empty method: by default it returns `df` unchanged. To transform, subclass `Pipeline` and override it. It runs once per batch, before Conform, so it sees the source column names.
+- **EXT-02** Extension points (`Pipeline` subclasses, `Reader`, `Writer`, `DQRule`) access the run through `self.context`, a `RunContext` with: `spark`, `config`, `run_id`, `batch_index`, `batch_ts`, `files` (file source; empty in a table source), `checkpoint` (`max_target` and `max_source`), `fs` (the `FileSystemAdapter`) and `logger`.
+- **EXT-03** `RunContext` is read-only: it MUST NOT be modified during the run.
 
 ---
 
@@ -396,6 +404,7 @@ The configuration MUST be validated before any read. Each combination below MUST
 | CFG-22 | `discovery = "folder_pattern"` with a `write_mode` other than `replace_where` | Without replacing the period, data would be repeated |
 | CFG-23 | `strategy` equal to `fixed_query` or `custom_query` without `query` | Nothing to read |
 | CFG-24 | `gate_type` without `gate_threshold`, or the other way around | The gate needs both |
+| CFG-25 | `dq_rules` entry without `name` or `condition`, duplicate rule names, or `action` other than `quarantine`, `warn` and `fail` | The rule cannot be applied or reported |
 
 ---
 
@@ -433,20 +442,20 @@ The configuration MUST be validated before any read. Each combination below MUST
 
 | Component | Kind | Responsibility |
 |---|---|---|
-| `PipelineConfig` | dataclass | Groups `SourceConfig`, `ValidityConfig`, `ConformConfig`, `DQConfig`, `TargetConfig`, `transform` and `run_id`. Exposes `from_dict(dict)` and `validate()` (CFG-*) |
+| `PipelineConfig` | dataclass | Groups `SourceConfig`, `ValidityConfig`, `ConformConfig`, `DQConfig`, `TargetConfig` and `run_id`. Exposes `from_dict(dict)` and `validate()` (CFG-*) |
 | `SourceConfig` | abstract | `source`. Specializations: `FileSourceConfig` (3.2) and `TableSourceConfig` (3.3) |
 | `ValidityConfig` | dataclass | Parameters in section 3.4 |
 | `ConformConfig` | dataclass | Parameters in section 3.5 |
 | `DQConfig` | dataclass | Parameters in section 3.6 |
 | `TargetConfig` | dataclass | Parameters in section 3.7 |
-| `Pipeline` | class | `run() -> RunResult`, following section 4 |
+| `Pipeline` | class | `run() -> RunResult`, following section 4. `transform(df) -> DataFrame`, overridable (EXT-01). `context` (EXT-02) |
+| `RunContext` | dataclass, read-only | EXT-02 |
 | `Reader` | extensible | `plan() -> list[Batch]`, `read(batch) -> DataFrame`. Implementations: `FileReader` and `TableReader` |
 | `FileSystemAdapter` | interface | `list_files(path, recursive) -> list[FileInfo]`, `exists(path) -> bool`, `move(src, dst)` (PRI-03) |
 | `FileInfo` | dataclass | `path`, `size`, `modification_time` |
-| `Transformer` | protocol | `(df, ctx) -> DataFrame` |
-| `ConformStep` | interface | `apply(df, ctx) -> DataFrame` |
+| `ConformStep` | interface | `apply(df) -> DataFrame` |
 | `DQRule` | extensible | `name`, `action` (`DQAction`), `condition() -> Column` |
-| `Writer` | extensible | `write(df, ctx) -> WriteMetrics` |
+| `Writer` | extensible | `write(df) -> WriteMetrics` |
 | `RunResult` | dataclass | Section 7 |
 
 Classes marked as extensible have a default implementation and MAY be overridden for specific cases.
@@ -483,22 +492,20 @@ Each scenario is a test. The "Rules" column shows what it covers.
 | AC-22 | Existing target without the expected checkpoint column | Run | Run fails with a message; the target is not treated as empty | ENUM-05 |
 | AC-23 | `discovery = "incremental"`; two files with the same modification time; only one was written | Run | The other is not read (expected v1 behavior) | DISC-04 |
 | AC-24 | `discovery = "file_compare"`; a file already written is rewritten with the same name | Run | The file is not read again | DISC-05 |
-| AC-25 | `folder_pattern`, `replace_where`, `chunk_size = 1`; a new file arrives in folder `2026-08/` | Run | Every file in `2026-08/` is read in one batch; period `2026-08` is replaced; `periods_replaced = ["2026-08"]` | PER-04, PER-07 |
+| AC-25 | `folder_pattern`, `replace_where`, `chunk_size = 1`; a new file arrives in folder `2026-08/` | Run | Every file in `2026-08/` is read in one batch; period `2026-08` is replaced; `periods_replaced = [2026-08-01]` | PER-04, PER-07 |
 | AC-26 | `replace_period_source = "value"`, `replace_period = "202608"`, no new file | Run | Reads only the files of period `202608` and replaces the period, ignoring the checkpoint | PER-05 |
 | AC-27 | Table source, `replace_where` by `year_month`; the window returns 1 new row of `202608` | Run | Every row of `202608` is re-read from the source before the period is replaced | PER-06 |
 | AC-28 | SCD2 with `overwrite`; source with every version, including one that arrived late | Run | History rebuilt with the late version in the right position; a single commit | SCD-06 |
 | AC-29 | String `dt_change` without a time zone | Run | `_modified_date` interpreted in the Spark session time zone, without conversion | VAL-04 |
 | AC-30 | `modified_date = "_created_ts"` coming from the previous layer | Run | `_modified_date` receives the previous layer's value; the run's own `_created_ts` is written normally | VAL-05, CONF-05 |
+| AC-31 | `path_pattern = "**/*.parquet"`; the folder also has `.csv` files | Run | Only the `.parquet` files are read | DISC-06 |
+| AC-32 | `data_types = {"amount": "decimal(18,2)"}` and `quarantine_table` set; a row with `amount = "12,5x"` | Run | The row is in quarantine with `amount = "12,5x"` and `"type:amount"` in `_dq_failed_rules` | DQ-03, DQ-08 |
+| AC-33 | `dq_rules = [{"name": "positive_amount", "condition": "amount > 0"}]`; rows with `amount` 10, -5 and null | Run | 10 passes; -5 and null go to quarantine with `"positive_amount"` in `_dq_failed_rules` | DQ-04 |
+| AC-34 | `Pipeline` subclass overriding `transform` to filter rows | Run | The filter is applied to every batch, before Conform | EXT-01 |
+| AC-35 | `replace_period_source = "value"`, `replace_period = "202608"`, `replace_period_format = "yyyyMM"` | Run | `_period = 2026-08-01`, as a `date` | PER-07 |
 
 ---
 
 ## 10. Not specified in v1
 
-These points have no defined behavior. The implementation MUST NOT invent a rule for them; it must raise the question.
-
-- Format of the `external_checkpoint` control table.
-- Semantics of `path_pattern`.
-- Schema of the quarantine table: columns beyond the row's own, such as the rule that failed.
-- Declarative format for DQ rules beyond `data_types` and `DQRule` in code.
-- Contents of the `ctx` received by `transform`, `ConformStep` and `Writer`.
-- Data type written to `_period`.
+There are no open points in v1. Anything not described in this document is still not specified: the implementation MUST NOT invent a rule for it; it must raise the question.

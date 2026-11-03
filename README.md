@@ -17,7 +17,7 @@ flowchart LR
 ```
 
 - **Read:** reads only what is new since the last load, by comparing the source with what is already written on the target.
-- **Transform:** an optional `transform(df, ctx)` function for load-specific logic.
+- **Transform:** an optional `transform` method, overridden in a subclass of `Pipeline`, for load-specific logic.
 - **Conform:** renames columns, fixes names Delta does not accept, resolves each row's validity and adds the metadata columns.
 - **Data Quality:** converts types and applies rules; failing rows go to a quarantine table, and a gate can block the batch.
 - **Dedup:** when there is a `merge_key`, keeps one row per key (or, in SCD2, one per change).
@@ -35,6 +35,14 @@ result = Pipeline(config).run()
 print(result.status, result.rows_inserted, result.rows_quarantined)
 ```
 
+For load-specific logic, subclass `Pipeline` and override `transform`, which receives and returns a DataFrame:
+
+```python
+class CustomersPipeline(Pipeline):
+    def transform(self, df):
+        return df.filter("CUST_STATUS <> 'TEST'")
+```
+
 ### 1. Table to table, with history (SCD2)
 
 ```python
@@ -47,12 +55,13 @@ params = {
     "scd2": True,
     "rename_columns": [{"CUST_CD": "customer_id"}, {"CUST_NM": "name"}],
     "data_types": {"customer_id": "int"},
+    "dq_rules": [{"name": "valid_email", "condition": "email LIKE '%@%'"}],
     "quarantine_table": "silver.customers_quarantine",
 }
 ```
 
 - Reads only the rows whose `updated_at` is newer than what is already on the target.
-- Renames the columns and converts `customer_id` to integer; rows that do not convert go to quarantine.
+- Renames the columns, converts `customer_id` to integer and checks the email; rows that fail go to quarantine.
 - Keeps each customer's history: the previous version is closed and the new one is inserted in the same commit.
 
 ### 2. Reading with a query

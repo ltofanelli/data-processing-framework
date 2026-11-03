@@ -56,8 +56,7 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    IN(["Batch DataFrame"]) --> TR{"transform set?"}
-    TR -->|yes| TFN["transform(df, ctx) -> df"]
+    IN(["Batch DataFrame"]) --> TFN["transform(df) -> df<br/>overridable, default: unchanged"]
 
     subgraph CONF_G["Conform"]
         REN["Column rename"] --> SAN["Fixes special characters<br/>in names"]
@@ -66,7 +65,6 @@ flowchart TD
         SEL --> META["Other metadata<br/>_run_id, _created_ts, _updated_ts,<br/>_source_file_path, _source_file_modified_ts"]
     end
 
-    TR -->|no| REN
     TFN --> REN
 
     subgraph DQ_G["Data Quality"]
@@ -127,7 +125,7 @@ Configuration complexity follows the complexity of the case:
 1. **Common path:** text parameters only: `source`, `target`, `file_format`, `modified_date`, `write_mode`, `merge_key`, `scd2`, `rename_columns`, `data_types`. No extra structure.
 2. **Out-of-pattern cases:** sub-parameters add context. Examples: there is no change-date column, the date is in the path, files must be read in groups.
 3. **Very specific cases:** extension points in code:
-   - a `transform(df, ctx)` function for transformation logic;
+   - overriding the `transform(df)` method for transformation logic;
    - overriding the `Reader` for very different sources;
    - overriding the `Writer` for unusual writes;
    - custom DQ rules (`DQRule`).
@@ -190,12 +188,31 @@ If the target does not exist, it is created on the first run with the schema of 
 
 ### Transformation
 
-When there is a transformation, it is a plain function that receives and returns a DataFrame:
+`Pipeline` has an empty `transform` method: by default it returns the DataFrame unchanged. When a load needs specific logic, subclass `Pipeline` and override it. It receives and returns a DataFrame, runs once per batch, before Conform, and sees the source column names (before the rename).
 
 ```python
-def transform(df, ctx):
-    return df.filter("amount > 0")
+class SalesPipeline(Pipeline):
+    def transform(self, df):
+        return df.filter("AMT > 0")
+
+result = SalesPipeline(config).run()
 ```
+
+Inside it, `self.context` gives read-only information about the run:
+
+| Field | Content |
+|---|---|
+| `spark` | The `SparkSession` |
+| `config` | The run's `PipelineConfig` |
+| `run_id` | Run identifier |
+| `batch_index` | Position of the batch in the run (0, 1, 2...) |
+| `batch_ts` | Batch time (the same as `_created_ts`) |
+| `files` | Files in the batch (file source); empty in a table source |
+| `checkpoint` | `max_target` and `max_source` used in the read |
+| `fs` | The `FileSystemAdapter` |
+| `logger` | Run logger |
+
+The same `self.context` is available in the other extension points (`Reader`, `Writer`, `DQRule`).
 
 ---
 
@@ -370,16 +387,15 @@ latest_load_only  = True
 
 ```mermaid
 flowchart LR
-    FS["FileSystemAdapter.list_files(root)<br/>recursive, ignores files<br/>starting with _ or ."] --> PV{"replace_period_source<br/>= value?"}
+    FS["FileSystemAdapter.list_files(root)<br/>recursive, filtered by path_pattern,<br/>ignores files starting with _ or ."] --> PV{"replace_period_source<br/>= value?"}
     PV -->|yes| FV["Files whose period in the path<br/>is the given value<br/>ignores the checkpoint, 1 batch"]
     PV -->|no| S{"discovery"}
 
     S -->|"incremental (default)"| M["File modification time ><br/>max(_source_file_modified_ts) on the target"]
     S -->|file_compare| FC["Path not yet in<br/>_source_file_path on the target"]
-    S -->|external_checkpoint| E["Compares with the control table<br/>provided by the user"]
     S -->|folder_pattern| F["Period folders with a file<br/>newer than the period on the target"]
 
-    M & FC & E --> NEW{"Any file?"}
+    M & FC --> NEW{"Any file?"}
     NEW -->|no| NONEW["no_new_data<br/>run ends without writing"]
     NEW -->|yes| OWF{"write_mode = overwrite?"}
     OWF -->|no| ORD["Sorts the new files<br/>by modification time and path"]
@@ -391,7 +407,7 @@ flowchart LR
     NEWP -->|yes| FB["Reads every file in each folder<br/>batches of whole folders<br/>chunk_size counts folders"]
 ```
 
-Listing is recursive and ignores files starting with `_` or `.` (for example, `_SUCCESS` and temporary files). A file with no rows writes nothing to the target, so it is read again in later runs; the cost is small.
+Listing is recursive and ignores files starting with `_` or `.` (for example, `_SUCCESS` and temporary files). `path_pattern`, a glob relative to `source`, narrows the listing further (for example, `**/*.parquet` or `sales_*.csv`); without it, every file is considered. A file with no rows writes nothing to the target, so it is read again in later runs; the cost is small.
 
 Discovery only decides **which files to read**. Row validity is a separate choice (see [Row validity](#row-validity)).
 
@@ -573,6 +589,10 @@ DQ runs after Conform and **before dedup**. So dedup only chooses among valid ro
 
 ```python
 data_types       = {"customer_id": "int", "amount": "decimal(18,2)"}
+dq_rules         = [
+    {"name": "positive_amount", "condition": "amount > 0"},
+    {"name": "valid_email", "condition": "email LIKE '%@%'", "action": "warn"},
+]
 quarantine_table = "silver.customers_quarantine"
 gate_type        = "percent"
 gate_threshold   = 2
@@ -580,17 +600,75 @@ gate_threshold   = 2
 
 ### Rules
 
-- **Automatic:** `merge_key`, `_modified_date` and `order_column` (when set) not null. Failing rows go to quarantine.
-- **`data_types`:** converts the columns to the given types. A row whose value does not convert goes to quarantine; valid rows are written already converted.
-- **Custom rules (`DQRule`):** each rule has an action:
-  - `FAIL`: a failing row fails the run;
-  - `QUARANTINE`: the row goes to quarantine;
-  - `WARN`: the row continues and is counted in `dq_by_rule`.
+Rules come from four places and are applied together:
+
+| Source | What it checks | Action |
+|---|---|---|
+| Automatic | `merge_key`, `_modified_date` and `order_column` (when set) are not null | `quarantine` |
+| `data_types` | The value converts to the given type | `quarantine` |
+| `dq_rules` | A SQL expression that a valid row satisfies | `quarantine` by default, or the one given |
+| `rules` | A `DQRule` class, in code | The one defined in the class |
+
+Actions:
+
+- `quarantine`: the row goes to the quarantine table;
+- `warn`: the row continues and is counted in `dq_by_rule`;
+- `fail`: a failing row fails the run.
+
+### Declarative rules (`dq_rules`)
+
+Each rule is a dictionary:
+
+| Key | Required | Content |
+|---|---|---|
+| `name` | Yes | Unique name. It appears in `dq_by_rule` and in the quarantine's `_dq_failed_rules` |
+| `condition` | Yes | Spark SQL expression over the final column names, describing what a **valid** row satisfies |
+| `action` | No | `quarantine` (default), `warn` or `fail` |
+
+- A row fails the rule when `condition` is false **or null**. So `amount > 0` also rejects a null `amount`; to accept nulls, say so in the expression.
+- Conditions see the values already converted by `data_types`.
+- For logic that does not fit an expression, such as a lookup in another table, use a `DQRule` class in code.
+
+Examples:
+
+```python
+dq_rules = [
+    # Value range
+    {"name": "positive_amount", "condition": "amount > 0"},
+
+    # Accepting nulls explicitly
+    {"name": "discount_range", "condition": "discount IS NULL OR discount BETWEEN 0 AND 1"},
+
+    # Allowed values
+    {"name": "valid_status", "condition": "status IN ('active', 'inactive', 'blocked')"},
+
+    # Text pattern that only warns
+    {"name": "valid_email", "condition": "email LIKE '%@%'", "action": "warn"},
+
+    # Consistency between columns
+    {"name": "end_after_start", "condition": "end_date IS NULL OR end_date >= start_date"},
+
+    # Something that should never happen: stops the run
+    {"name": "known_currency", "condition": "currency IN ('BRL', 'USD', 'EUR')", "action": "fail"},
+]
+```
 
 ### Quarantine
 
-- Failing rows are written to `quarantine_table`. Without `quarantine_table`, a row that would go to quarantine fails the run, including for automatic rules.
+- Failing rows are appended to `quarantine_table`. Without `quarantine_table`, a row that would go to quarantine fails the run, including for automatic rules.
+- The quarantine keeps the row's columns (final names) with their values **before** the `data_types` conversion, so the value that failed is preserved. It also has the run's metadata columns and `_dq_failed_rules`, the list of every rule the row failed. Automatic rules appear as `not_null:<column>` and `type:<column>`.
+- New columns are added to the quarantine table as on the target.
 - Because the checkpoint is the maximum on the target, quarantined rows are read again on every run and go back to quarantine until they are fixed at the source.
+
+Example, with `data_types = {"amount": "decimal(18,2)"}` and the rule `positive_amount`:
+
+| customer_id | amount | `_dq_failed_rules` |
+|---|---|---|
+| 10 | `12,5x` | `["type:amount", "positive_amount"]` |
+| 11 | `-3.00` | `["positive_amount"]` |
+| 12 | null | `["positive_amount"]` |
+
+Row 10 fails both rules: `12,5x` does not convert to a decimal, and the converted value (null) does not satisfy `amount > 0`.
 
 ### Gate
 
@@ -661,7 +739,7 @@ Replaces the whole target, in a single batch:
 
 ### Periods with `replace_where`
 
-`replace_where` replaces on the target the periods present in the batch. The period (for example, a month) is written to `_period` and used in the `replaceWhere` predicate. The period source is defined in `replace_period_source`:
+`replace_where` replaces on the target the periods present in the batch. The period (for example, a month) is written to `_period` and used in the `replaceWhere` predicate. With `path` and `value`, `_period` is a `date` with the first day of the period, parsed with `replace_period_format`, so `2026-08` and `202608` both become `2026-08-01`. With `column`, it keeps the column's value and type. The period source is defined in `replace_period_source`:
 
 | `replace_period_source` | Source | Period |
 |---|---|---|
@@ -802,7 +880,7 @@ A type change requires a decision from whoever maintains the pipeline. When the 
 | `_modified_date` | `modified_date` set | Row validity (see [Row validity](#row-validity)) |
 | `_source_file_path` | File source | Path of the source file |
 | `_source_file_modified_ts` | File source | Modification time of the source file |
-| `_period` | `write_mode = "replace_where"` | The row's period: from the path, the given value or the column |
+| `_period` | `write_mode = "replace_where"` | The row's period: a `date` with the first day of the period (from the path or the given value), or the column's own value |
 | `_valid_from`, `_valid_to`, `_is_current`, `_version` | `scd2 = True` | Version control (see [SCD2](#scd2)) |
 
 By write mode, excluding the file columns and `_period`:
@@ -843,6 +921,7 @@ classDiagram
         VALID_TO = "_valid_to"
         IS_CURRENT = "_is_current"
         VERSION = "_version"
+        DQ_FAILED_RULES = "_dq_failed_rules"
     }
     class Defaults {
         DATETIME_FORMAT = "yyyy-MM-dd HH:mm:ss.SSSSSS"
@@ -864,7 +943,6 @@ classDiagram
     class DiscoveryStrategy {
         INCREMENTAL
         FILE_COMPARE
-        EXTERNAL_CHECKPOINT
         FOLDER_PATTERN
     }
     class ReadStrategy {
@@ -920,7 +998,6 @@ classDiagram
         run_id: str
         source: SourceConfig
         validity: ValidityConfig
-        transform: Transformer
         conform: ConformConfig
         quality: DQConfig
         target: TargetConfig
@@ -960,6 +1037,7 @@ classDiagram
     }
     class DQConfig {
         data_types: dict
+        dq_rules: list
         rules: list~DQRule~
         quarantine_table: str
         gate_type: GateType
@@ -993,7 +1071,21 @@ classDiagram
 classDiagram
     class Pipeline {
         config: PipelineConfig
+        context: RunContext
         run() RunResult
+        transform(df) DataFrame
+    }
+    class RunContext {
+        <<read-only>>
+        spark: SparkSession
+        config: PipelineConfig
+        run_id: str
+        batch_index: int
+        batch_ts: datetime
+        files: list~FileInfo~
+        checkpoint: dict
+        fs: FileSystemAdapter
+        logger: Logger
     }
     class Reader {
         <<extensible>>
@@ -1013,13 +1105,9 @@ classDiagram
         size: int
         modification_time: datetime
     }
-    class Transformer {
-        <<protocol>>
-        call(df, ctx) DataFrame
-    }
     class ConformStep {
         <<interface>>
-        apply(df, ctx) DataFrame
+        apply(df) DataFrame
     }
     class DQRule {
         <<extensible>>
@@ -1029,12 +1117,12 @@ classDiagram
     }
     class Writer {
         <<extensible>>
-        write(df, ctx) WriteMetrics
+        write(df) WriteMetrics
     }
     class RunResult
 
+    Pipeline --> RunContext
     Pipeline --> Reader
-    Pipeline --> Transformer
     Pipeline --> ConformStep
     Pipeline --> DQRule
     Pipeline --> Writer
@@ -1045,7 +1133,7 @@ classDiagram
     FileSystemAdapter --> FileInfo
 ```
 
-Classes marked as `extensible` have default implementations that can be overridden for specific cases.
+Classes marked as `extensible` have default implementations that can be overridden for specific cases. `Pipeline.transform` is empty by default and is overridden in a subclass (see [Transformation](#transformation)). Every extension point reads the run through `self.context`.
 
 ---
 
@@ -1080,6 +1168,7 @@ The configuration is validated before any read. The full list, with IDs, is in s
 | `replace_period_source` incompatible with the source (`path` or `value` in a table source, `column` in a file source) | In a file source, the period comes from the path or a value; in a table source, from a column |
 | `discovery = "folder_pattern"` with a `write_mode` other than `replace_where` | The whole folder is re-read on every change; without replacing the period, data would be repeated |
 | `gate_type` without `gate_threshold`, or the other way around | The gate needs both |
+| `dq_rules` entry without `name` or `condition`, duplicate rule names, or `action` other than `quarantine`, `warn` and `fail` | The rule cannot be applied or reported |
 
 ---
 

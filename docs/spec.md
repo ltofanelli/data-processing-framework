@@ -57,7 +57,7 @@
 |---|---|---|---|---|
 | `file_format` | str | — | Spark read format (`parquet`, `csv`, `json`...). Setting it makes the source a file source | SRC-01 |
 | `read_options` | dict | `{}` | Options passed to the Spark reader | — |
-| `discovery` | str | `incremental` | `incremental`, `file_compare`, `folder_pattern` | DISC-* |
+| `discovery` | str | `incremental` | `incremental`, `file_compare` | DISC-* |
 | `chunk_size` | int | no chunk: 1 batch | ≥ 1 | DISC-07 |
 | `path_pattern` | str | — (every file) | Glob relative to `source`, e.g. `**/*.parquet` | DISC-06 |
 
@@ -163,11 +163,12 @@ plan(config), file source:
     files = list(source), filtered by path_pattern                    # DISC-01, DISC-06
     if replace_period_source == value:
         return [files whose period in the path == replace_period]     # PER-05
-    if discovery == folder_pattern:
-        return batches of whole selected folders                      # PER-04
     new = files selected by discovery                                 # DISC-02, DISC-05
     if new is empty: return []                                        # DISC-08
     if write_mode == overwrite: return [all listed files]             # DISC-09
+    if write_mode == replace_where:
+        periods = periods of new, sorted by their newest file         # PER-04
+        return every listed file of each period, chunk_size periods per batch
     sort new by (modification time, path)                             # DISC-03
     return new grouped by chunk_size                                  # DISC-07
 ```
@@ -191,7 +192,7 @@ plan(config), file source:
 - **DISC-04** Ties in `incremental` are not handled: a file with the same time as the target's maximum is not read. This is the expected v1 behavior; `file_compare` avoids the problem.
 - **DISC-05** `file_compare`: selects files whose path is not among the distinct `_source_file_path` values on the target. The file's identity is its path: a file rewritten with the same name is not read again.
 - **DISC-06** `path_pattern` is a glob relative to `source` (for example, `**/*.parquet` or `sales_*.csv`), applied to the listed files before discovery. Without it, every listed file is considered; DISC-01 still applies.
-- **DISC-07** No `chunk_size`: all selected files in one batch. `chunk_size = N`: N files per batch. With `folder_pattern`, N counts folders (PER-04).
+- **DISC-07** No `chunk_size`: all selected files in one batch. `chunk_size = N`: N files per batch. With `replace_where`, N counts periods (PER-04).
 - **DISC-08** No file selected: the run ends with status `no_new_data`, without writing.
 - **DISC-09** With `write_mode = "overwrite"`, discovery only decides whether there is a new file. If there is, all listed files MUST be read, in a single batch.
 - **DISC-10** A file with no rows writes nothing to the target and is therefore selected again in later runs. This behavior is accepted.
@@ -299,12 +300,13 @@ plan(config), file source:
 
 - **PER-01** The period source is `replace_period_source`: `path` (default in a file source), `value` (file source only) or `column` (default and only option in a table source).
 - **PER-02** With `path`, the period is the capture group of `replace_period_regex` applied to the path, converted with `replace_period_format`.
-- **PER-03** One file per period: the normal discovery (`incremental`) works, and `chunk_size` groups files normally.
-- **PER-04** One folder per period (`discovery = "folder_pattern"`):
-  - a folder is selected when it has a file whose modification time is greater than the largest `_source_file_modified_ts` written for that period on the target, or when the period does not exist on the target;
-  - every file of the selected folder is read, including those already written;
-  - a period MUST NOT be split across batches, and `chunk_size` counts folders;
-  - a file deleted from the folder does not trigger reprocessing.
+- **PER-03** Since the whole period is replaced, it MUST arrive whole in the batch, whether the period is a file, several files or a folder.
+- **PER-04** With `replace_where` in a file source, the unit of reading is the period:
+  - discovery (DISC-02 or DISC-05) finds the new files, and the periods of those files are selected;
+  - every listed file of each selected period is read, including files already written;
+  - a period MUST NOT be split across batches, and `chunk_size` counts periods;
+  - periods are processed in the order of their newest file (modification time, path), so the checkpoint advances in order;
+  - a file deleted from the source does not trigger reprocessing: a period is re-read only when a new file arrives for it.
 - **PER-05** With `value`, `source` is still the root:
   - only files whose period in the path (PER-02) equals `replace_period` are read;
   - the value uses the same format as the period in the path;
@@ -315,6 +317,8 @@ plan(config), file source:
   - without a checkpoint, the source is read in full;
   - with `custom_query`, the query must return complete periods.
 - **PER-07** The period is written to `_period`. With `path` and `value`, `_period` is a `date`: the first day of the period, parsed with `replace_period_format`, so `2026-08` and `202608` both become `2026-08-01`. With `column`, it keeps the column's value and type. `replaceWhere` replaces the `_period` values present in the batch. Replaced periods are reported in `periods_replaced`.
+- **PER-08** A period file re-delivered under a new name while the old one stays at the source makes both files be read. With `merge_key`, dedup keeps one row per key; without it, the old file must be removed from the source.
+- **PER-09** A period that disappears from the source is not deleted from the target.
 
 ### 5.11 Schema (SCH)
 
@@ -401,10 +405,9 @@ The configuration MUST be validated before any read. Each combination below MUST
 | CFG-19 | `replace_where` in a table source without `replace_period` | No period column |
 | CFG-20 | `replace_period_source = "value"` without `replace_period` | No period provided |
 | CFG-21 | `replace_period_source` incompatible with the source (`path` or `value` in a table source, `column` in a file source) | PER-01 |
-| CFG-22 | `discovery = "folder_pattern"` with a `write_mode` other than `replace_where` | Without replacing the period, data would be repeated |
-| CFG-23 | `strategy` equal to `fixed_query` or `custom_query` without `query` | Nothing to read |
-| CFG-24 | `gate_type` without `gate_threshold`, or the other way around | The gate needs both |
-| CFG-25 | `dq_rules` entry without `name` or `condition`, duplicate rule names, or `action` other than `quarantine`, `warn` and `fail` | The rule cannot be applied or reported |
+| CFG-22 | `strategy` equal to `fixed_query` or `custom_query` without `query` | Nothing to read |
+| CFG-23 | `gate_type` without `gate_threshold`, or the other way around | The gate needs both |
+| CFG-24 | `dq_rules` entry without `name` or `condition`, duplicate rule names, or `action` other than `quarantine`, `warn` and `fail` | The rule cannot be applied or reported |
 
 ---
 
@@ -492,7 +495,7 @@ Each scenario is a test. The "Rules" column shows what it covers.
 | AC-22 | Existing target without the expected checkpoint column | Run | Run fails with a message; the target is not treated as empty | ENUM-05 |
 | AC-23 | `discovery = "incremental"`; two files with the same modification time; only one was written | Run | The other is not read (expected v1 behavior) | DISC-04 |
 | AC-24 | `discovery = "file_compare"`; a file already written is rewritten with the same name | Run | The file is not read again | DISC-05 |
-| AC-25 | `folder_pattern`, `replace_where`, `chunk_size = 1`; a new file arrives in folder `2026-08/` | Run | Every file in `2026-08/` is read in one batch; period `2026-08` is replaced; `periods_replaced = [2026-08-01]` | PER-04, PER-07 |
+| AC-25 | `replace_where` with the period in the folder (`/2026-08/`), `chunk_size = 1`; folder `2026-08/` has 2 written files and a new one arrives | Run | The 3 files of `2026-08/` are read in one batch; period `2026-08` is replaced; `periods_replaced = [2026-08-01]` | PER-04, PER-07 |
 | AC-26 | `replace_period_source = "value"`, `replace_period = "202608"`, no new file | Run | Reads only the files of period `202608` and replaces the period, ignoring the checkpoint | PER-05 |
 | AC-27 | Table source, `replace_where` by `year_month`; the window returns 1 new row of `202608` | Run | Every row of `202608` is re-read from the source before the period is replaced | PER-06 |
 | AC-28 | SCD2 with `overwrite`; source with every version, including one that arrived late | Run | History rebuilt with the late version in the right position; a single commit | SCD-06 |
@@ -503,6 +506,7 @@ Each scenario is a test. The "Rules" column shows what it covers.
 | AC-33 | `dq_rules = [{"name": "positive_amount", "condition": "amount > 0"}]`; rows with `amount` 10, -5 and null | Run | 10 passes; -5 and null go to quarantine with `"positive_amount"` in `_dq_failed_rules` | DQ-04 |
 | AC-34 | `Pipeline` subclass overriding `transform` to filter rows | Run | The filter is applied to every batch, before Conform | EXT-01 |
 | AC-35 | `replace_period_source = "value"`, `replace_period = "202608"`, `replace_period_format = "yyyyMM"` | Run | `_period = 2026-08-01`, as a `date` | PER-07 |
+| AC-36 | `replace_where` with the period in the file name; `sales_2026-08_part1` already written | `sales_2026-08_part2` arrives | Both files are read and period `2026-08` is replaced with both | PER-04 |
 
 ---
 

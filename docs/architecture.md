@@ -30,7 +30,7 @@ flowchart TD
     DISC -->|no new file| NONEW_F["no_new_data<br/>ends without writing"]
     DISC -->|new files| BATCH{"chunk_size"}
     BATCH -->|not set| B3["All files<br/>in 1 batch"]
-    BATCH -->|N| B2["N files per batch<br/>1 = file by file<br/>folder_pattern: N folders"]
+    BATCH -->|N| B2["N files per batch<br/>1 = file by file<br/>replace_where: N periods"]
     B2 & B3 --> FREAD["FileReader.read(batch)<br/>merged batch schema"]
 
     SRC -->|table| TSTRAT{"ReadStrategy"}
@@ -393,25 +393,21 @@ flowchart LR
 
     S -->|"incremental (default)"| M["File modification time ><br/>max(_source_file_modified_ts) on the target"]
     S -->|file_compare| FC["Path not yet in<br/>_source_file_path on the target"]
-    S -->|folder_pattern| F["Period folders with a file<br/>newer than the period on the target"]
 
     M & FC --> NEW{"Any file?"}
     NEW -->|no| NONEW["no_new_data<br/>run ends without writing"]
-    NEW -->|yes| OWF{"write_mode = overwrite?"}
-    OWF -->|no| ORD["Sorts the new files<br/>by modification time and path"]
-    OWF -->|yes| ALL["Uses every listed file<br/>in a single batch"]
+    NEW -->|yes| WM{"write_mode"}
+    WM -->|overwrite| ALL["Uses every listed file<br/>in a single batch"]
+    WM -->|replace_where| PER["Periods of the new files<br/>reads every file of each period<br/>chunk_size counts periods"]
+    WM -->|other modes| ORD["Sorts the new files<br/>by modification time and path"]
     ORD --> CH["Groups into batches<br/>by chunk_size"]
-
-    F --> NEWP{"Any folder?"}
-    NEWP -->|no| NONEW
-    NEWP -->|yes| FB["Reads every file in each folder<br/>batches of whole folders<br/>chunk_size counts folders"]
 ```
 
 Listing is recursive and ignores files starting with `_` or `.` (for example, `_SUCCESS` and temporary files). `path_pattern`, a glob relative to `source`, narrows the listing further (for example, `**/*.parquet` or `sales_*.csv`); without it, every file is considered. A file with no rows writes nothing to the target, so it is read again in later runs; the cost is small.
 
 Discovery only decides **which files to read**. Row validity is a separate choice (see [Row validity](#row-validity)).
 
-Without `chunk_size`, all selected files go in a single batch; with `chunk_size = N`, they go N per batch (`1` = file by file). With `folder_pattern`, `chunk_size` counts folders (see [Periods with `replace_where`](#periods-with-replace_where)). With `overwrite`, discovery only decides whether there is a new file: if there is, every listed file is read in a single batch.
+Without `chunk_size`, all selected files go in a single batch; with `chunk_size = N`, they go N per batch (`1` = file by file). With `replace_where`, `chunk_size` counts periods (see [Periods with `replace_where`](#periods-with-replace_where)). With `overwrite`, discovery only decides whether there is a new file: if there is, every listed file is read in a single batch.
 
 #### `incremental` (default)
 
@@ -747,30 +743,33 @@ Replaces the whole target, in a single batch:
 | `value` | File | Value given in `replace_period`, for example by the process that calls the pipeline |
 | `column` (default in a table source) | Table | Column given in `replace_period` |
 
-Since the whole period is replaced, it must arrive whole in the batch. That depends on how the data is organized.
+Since the whole period is replaced, it must arrive whole in the batch, whether the period is a single file, several files or a folder. So in a file source the unit of reading is the period:
 
-**One file per period.** Each file holds the complete period (for example, `sales_2026-08.parquet`). The default discovery (`incremental`) already works: each new file replaces its period, and `chunk_size` groups files normally.
+- Discovery (`incremental` or `file_compare`) finds the new files, and the periods of those files are selected.
+- Every file of each selected period is read, including files already written. If `sales_2026-08_part1` was loaded yesterday and `sales_2026-08_part2` arrives today, both are read and the period is replaced with both.
+- A period is never split across batches, and `chunk_size` counts periods, not files.
+- Periods are processed in the order of their newest file, so the checkpoint advances in order.
+
+The regex says where the period is: in the file name or in the folder.
 
 ```python
+# Period in the file name: sales_2026-08.parquet, sales_2026-08_part2.parquet
 write_mode            = "replace_where"
-replace_period_regex  = r"_(\d{4}-\d{2})\.parquet$"
+replace_period_regex  = r"_(\d{4}-\d{2})(_|\.)"
 replace_period_format = "yyyy-MM"
-```
 
-**One folder per period.** The period is the folder (for example, `2026-08/`), with several files. Reading only the new files would replace the period with incomplete data, so the read unit becomes the whole folder, with `discovery = "folder_pattern"`:
-
-- A folder is selected when it has at least one file newer than the largest `_source_file_modified_ts` written for that period on the target, or when the period does not exist on the target yet.
-- Every file in the selected folder is read, including those already written.
-- Batches are made of whole folders, and a period is never split across batches. Here `chunk_size` counts folders, not files.
-- A file deleted from the folder does not trigger reprocessing: the period is only re-read when a newer file arrives.
-
-```python
-discovery             = "folder_pattern"
+# Period in the folder: /2026-08/part-0001.parquet
 write_mode            = "replace_where"
 replace_period_regex  = r"/(\d{4}-\d{2})/"
 replace_period_format = "yyyy-MM"
 chunk_size            = 1          # one period per batch
 ```
+
+Cases to keep in mind:
+
+- **Re-delivered file.** If a period's file is sent again under a new name and the old one stays at the source, both are read. With `merge_key`, dedup keeps one row per key; without it, remove the old file from the source.
+- **Deleted file.** A file deleted from the source does not trigger reprocessing: the period is only re-read when a new file arrives for it.
+- **Deleted period.** A period that disappears from the source is not deleted from the target.
 
 **Period given by another process.** The calling process passes the period to process:
 
@@ -943,7 +942,6 @@ classDiagram
     class DiscoveryStrategy {
         INCREMENTAL
         FILE_COMPARE
-        FOLDER_PATTERN
     }
     class ReadStrategy {
         CHECKPOINT_COLUMN
@@ -1166,7 +1164,6 @@ The configuration is validated before any read. The full list, with IDs, is in s
 | `write_mode = "replace_where"` in a table source without `replace_period` | No period column |
 | `replace_period_source = "value"` without `replace_period` | No period provided |
 | `replace_period_source` incompatible with the source (`path` or `value` in a table source, `column` in a file source) | In a file source, the period comes from the path or a value; in a table source, from a column |
-| `discovery = "folder_pattern"` with a `write_mode` other than `replace_where` | The whole folder is re-read on every change; without replacing the period, data would be repeated |
 | `gate_type` without `gate_threshold`, or the other way around | The gate needs both |
 | `dq_rules` entry without `name` or `condition`, duplicate rule names, or `action` other than `quarantine`, `warn` and `fail` | The rule cannot be applied or reported |
 
